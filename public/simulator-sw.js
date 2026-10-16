@@ -99,6 +99,14 @@ class SimServer {
     return this.route("POST", priority, path, handler);
   }
 
+  put(priority, path, handler) {
+    return this.route("PUT", priority, path, handler);
+  }
+
+  delete(priority, path, handler) {
+    return this.route("DELETE", priority, path, handler);
+  }
+
   // Find the highest-priority route matching the request.
   findRoute(method, actualSegments) {
     let best = null;
@@ -279,7 +287,6 @@ server.get(0, "/404.html", (req) => {
 
 
 
-
 self.addEventListener("install", event => {
   event.waitUntil(self.skipWaiting());
 });
@@ -288,7 +295,13 @@ self.addEventListener("activate", event => {
   event.waitUntil(self.clients.claim());
 });
 
-self.addEventListener("fetch", (event) => {
-  event.respondWith(server.fetch(event.request));
-});
+self.addEventListener("fetch", event => {
+  const request = event.request;
+  const url = new URL(request.url);
 
+  if (url.origin !== self.location.origin) {
+    return;
+  }
+
+  event.respondWith(server.fetch(request));
+});
