@@ -1,184 +1,294 @@
-/*
- * Same-origin response simulator.
- * To change behavior, edit ROUTES and handleAction below.
- * Unmatched same-origin requests are forwarded to the real server by default.
- */
-const SIMULATOR_SOURCE = 'raysite-simulator';
-const FALLBACK_MODE = 'network'; // 'network' or '404'
-
-function json(body, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(body, null, 2), {
-    status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
-      ...extraHeaders
-    }
-  });
-}
-
-function html(body, status = 200) {
-  return new Response(body, {
-    status,
-    headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store'
-    }
-  });
-}
-
-function css(body, status = 200) {
-  return new Response(body, {
-    status,
-    headers: {
-      'Content-Type': 'text/css; charset=utf-8',
-      'Cache-Control': 'no-store'
-    }
-  });
-}
-
-async function readRequestBody(request) {
-  if (request.method === 'GET' || request.method === 'HEAD') return null;
-  const text = await request.clone().text();
-  if (!text) return null;
-  const contentType = request.headers.get('content-type') || '';
-  if (contentType.includes('application/json')) {
-    try { return JSON.parse(text); } catch { return { raw: text }; }
+function normalizePath(path) {
+  if (typeof path !== "string" || !path.startsWith("/")) {
+    throw new TypeError("Route paths must start with '/'");
   }
-  return { raw: text };
+
+  // Treat /what and /what/ as equivalent.
+  if (path !== "/") {
+    path = path.replace(/\/+$/, "");
+  }
+
+  return path || "/";
 }
 
-async function broadcast(message) {
-  const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-  for (const client of windows) {
-    if (new URL(client.url).origin === self.location.origin) {
-      client.postMessage({ source: SIMULATOR_SOURCE, ...message });
+function getSegments(path) {
+  const normalized = normalizePath(path);
+
+  return normalized === "/"
+    ? []
+    : normalized.slice(1).split("/");
+}
+
+// *  = exactly one non-empty segment
+// ** = zero or more segments
+function matchesSegments(pattern, actual, pi = 0, ai = 0) {
+  if (pi === pattern.length) {
+    return ai === actual.length;
+  }
+
+  const segment = pattern[pi];
+
+  if (segment === "**") {
+    // ** at the end matches any remaining number of segments.
+    if (pi === pattern.length - 1) {
+      return true;
+    }
+
+    // Try matching zero, one, or more segments.
+    for (let i = ai; i <= actual.length; i++) {
+      if (matchesSegments(pattern, actual, pi + 1, i)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  if (ai >= actual.length) {
+    return false;
+  }
+
+  if (segment === "*") {
+    if (actual[ai] === "") {
+      return false;
+    }
+  } else if (segment !== actual[ai]) {
+    return false;
+  }
+
+  return matchesSegments(pattern, actual, pi + 1, ai + 1);
+}
+
+class SimServer {
+  constructor() {
+    this.routes = [];
+    this.registrationOrder = 0;
+  }
+
+  // Generic registration method.
+  route(method, priority, path, handler) {
+    method = String(method).toUpperCase();
+
+    if (!Number.isFinite(priority)) {
+      throw new TypeError("Route priority must be a finite number");
+    }
+
+    if (typeof handler !== "function") {
+      throw new TypeError("Route handler must be a function");
+    }
+
+    const normalizedPath = normalizePath(path);
+
+    this.routes.push({
+      method,
+      priority,
+      path: normalizedPath,
+      segments: getSegments(normalizedPath),
+      handler,
+      order: this.registrationOrder++
+    });
+
+    return this;
+  }
+
+  get(priority, path, handler) {
+    return this.route("GET", priority, path, handler);
+  }
+
+  post(priority, path, handler) {
+    return this.route("POST", priority, path, handler);
+  }
+
+  // Find the highest-priority route matching the request.
+  findRoute(method, actualSegments) {
+    let best = null;
+
+    for (const route of this.routes) {
+      if (route.method !== method) {
+        continue;
+      }
+
+      if (!matchesSegments(route.segments, actualSegments)) {
+        continue;
+      }
+
+      // Equal priorities preserve registration order.
+      if (best === null || route.priority > best.priority) {
+        best = route;
+      }
+    }
+
+    return best;
+  }
+
+  // Find the registered 404.html handler.
+  findNotFoundRoute() {
+    let best = null;
+
+    for (const route of this.routes) {
+      if (route.method !== "GET" || route.path !== "/404.html") {
+        continue;
+      }
+
+      if (best === null || route.priority > best.priority) {
+        best = route;
+      }
+    }
+
+    return best;
+  }
+
+  async runHandler(route, req) {
+    const response = await route.handler(req);
+
+    if (!(response instanceof Response)) {
+      throw new TypeError(
+        `Handler for ${route.method} ${route.path} must return a Response`
+      );
+    }
+
+    return response;
+  }
+
+  // Ensure HEAD responses never contain a body.
+  finishResponse(response, req, statusOverride = null) {
+    const status = statusOverride ?? response.status;
+
+    if (req.method !== "HEAD" && statusOverride === null) {
+      return response;
+    }
+
+    return new Response(
+      req.method === "HEAD" ? null : response.body,
+      {
+        status,
+        statusText:
+          status === 404 ? "Not Found" : response.statusText,
+        headers: response.headers
+      }
+    );
+  }
+
+  // Main entry point: pass a Request, receive a Response.
+  async fetch(req) {
+    if (!(req instanceof Request)) {
+      throw new TypeError("server.fetch() requires a Request object");
+    }
+
+    try {
+      const url = new URL(req.url);
+      const actualSegments = getSegments(url.pathname);
+
+      // 1. Find the highest-priority matching route.
+      const route = this.findRoute(req.method, actualSegments);
+
+      if (route) {
+        const response = await this.runHandler(route, req);
+        return this.finishResponse(response, req);
+      }
+
+      // 2. No match: execute the special 404.html handler.
+      const notFoundRoute = this.findNotFoundRoute();
+
+      if (notFoundRoute) {
+        const response = await this.runHandler(notFoundRoute, req);
+
+        return this.finishResponse(response, req, 404);
+      }
+
+      // 3. No route and no custom 404 page.
+      return new Response(
+        req.method === "HEAD" ? null : "Not Found",
+        {
+          status: 404,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store"
+          }
+        }
+      );
+    } catch (error) {
+      // Handler errors or invalid handler results become HTTP 500.
+      return new Response(
+        JSON.stringify({
+          error: "Simulator handler failed",
+          detail: String(error)
+        }),
+        {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store"
+          }
+        }
+      );
     }
   }
 }
 
-async function commitHandler(request, url) {
-  const body = await readRequestBody(request);
-  await broadcast({ type: 'BUILDER_ACTION', action: body?.action || 'publish', requestBody: body });
+
+
+const server = new SimServer();
+
+server.get(10, "/assets/main.css", (req) => {
+  return css(`
+    /* Original CSS content */
+  `);
+});
+
+server.post(10, "/commit", async (req) => {
+  const body = await readRequestBody(req);
+
+  broadcast({
+    type: "BUILDER_ACTION",
+    payload: body
+  });
+
+  return json({ ok: true });
+});
+
+server.get(10, "/api/page", (req) => {
+  return json({
+    ok: true
+  });
+});
+
+server.get(10, "/api/failure-demo", (req) => {
+  return json({
+    ok: false,
+    error: "Simulated failure"
+  }, 500);
+});
+
+server.get(10, "/simulator/health", (req) => {
   return json({
     ok: true,
-    simulated: true,
-    endpoint: url.pathname,
-    receivedMethod: request.method,
-    receivedBody: body,
-    message: 'Commit simulated successfully.'
-  }, 200);
-}
+    status: "healthy"
+  });
+});
 
-// Ordered route definitions. Add routes here to simulate more of your app's HTTP API.
-const ROUTES = [
-  {
-    method: 'GET',
-    path: '/assets/main.css',
-    handler: async () => css(`
-      :root { font: 16px/1.5 system-ui, sans-serif; color: #172033; }
-      body { margin: 0; padding: 22px; background: linear-gradient(135deg, #eef6ff, #f7f0ff); }
-      .preview-card { max-width: 760px; margin: 0 auto; padding: 22px; background: white; border: 1px solid #d8e1ef; border-radius: 16px; box-shadow: 0 8px 28px #20305018; }
-      h1 { margin-top: 0; color: #3d46a5; }
-      .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
-      button { border: 0; border-radius: 8px; padding: 10px 12px; background: #424fc7; color: white; cursor: pointer; }
-      button:hover { background: #303b9f; }
-      pre { overflow: auto; padding: 12px; background: #f0f3f8; border-radius: 8px; white-space: pre-wrap; }
-      code { background: #f0f3f8; padding: 2px 5px; border-radius: 4px; }
-    `)
-  },
-  {
-    method: 'POST',
-    path: '/commit',
-    handler: commitHandler
-  },
-  {
-    method: 'GET',
-    path: '/api/page',
-    handler: async () => json({
-      id: 'home',
-      title: 'Demo home page',
-      components: [{ type: 'heading', text: 'Hello from the simulated server' }],
-      simulated: true
-    })
-  },
-  {
-    method: 'GET',
-    path: '/api/failure-demo',
-    handler: async () => json({ error: 'Simulated server error' }, 500)
-  },
-  {
-    method: 'GET',
-    path: '/simulator/health',
-    handler: async () => json({ ok: true, simulator: 'running' })
-  }
-];
+server.get(0, "/404.html", (req) => {
+  return html(`
+    <!doctype html>
+    <html>
+      <head><title>404 Not Found</title></head>
+      <body><h1>404 Not Found</h1></body>
+    </html>
+  `, 404);
+});
 
-self.addEventListener('install', event => {
+
+
+
+self.addEventListener("install", event => {
   event.waitUntil(self.skipWaiting());
 });
 
-self.addEventListener('activate', event => {
+self.addEventListener("activate", event => {
   event.waitUntil(self.clients.claim());
 });
 
-self.addEventListener('fetch', event => {
-  const request = event.request;
-  const url = new URL(request.url);
-
-  // Only this origin is simulated. External origins remain untouched.
-  if (url.origin !== self.location.origin) return;
-
-  // Ignore browser-only schemes and requests not handled as HTTP(S).
-  if (!['http:', 'https:'].includes(url.protocol)) return;
-
-  event.respondWith((async () => {
-    const route = ROUTES.find(candidate =>
-      candidate.method === request.method && candidate.path === url.pathname
-    );
-
-    if (!route) {
-      await broadcast({
-        type: 'REQUEST_PASSTHROUGH',
-        method: request.method,
-        pathname: url.pathname
-      });
-
-      if (FALLBACK_MODE === '404') {
-        const response = new Response(JSON.stringify({
-          error: 'Not Found',
-          simulated: true,
-          method: request.method,
-          path: url.pathname
-        }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
-        });
-        return response;
-      }
-
-      // The service worker sees the request, but this mode forwards it to the origin server.
-      return fetch(request);
-    }
-
-    let response;
-    try {
-      response = await route.handler(request, url);
-    } catch (error) {
-      response = json({ error: 'Simulator handler failed', detail: String(error) }, 500);
-    }
-
-    await broadcast({
-      type: 'REQUEST_SIMULATED',
-      method: request.method,
-      pathname: url.pathname,
-      status: response.status
-    });
-
-    // HEAD must not return a body. Preserve status and headers from the selected route.
-    if (request.method === 'HEAD') {
-      return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
-    }
-    return response;
-  })());
+self.addEventListener("fetch", (event) => {
+  event.respondWith(server.fetch(event.request));
 });
+
