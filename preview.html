@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- This URL intentionally demonstrates a CSS path that the simulator can provide. -->
+  <link rel="stylesheet" href="/assets/main.css">
+  <title>Simulated preview</title>
+</head>
+<body>
+  <main class="preview-card">
+    <h1>Preview website</h1>
+    <p>The stylesheet at <code>/assets/main.css</code> is supplied by the service worker.</p>
+    <div class="buttons">
+      <button id="commit">POST /commit</button>
+      <button id="load-page">GET /api/page</button>
+      <button id="unmatched">GET /things (pass-through)</button>
+      <button id="external">GET external example.com URL</button>
+    </div>
+    <h2>Response</h2>
+    <pre id="result">Choose a request above.</pre>
+  </main>
+  <script>
+    const result = document.querySelector('#result');
+    async function run(url, options) {
+      try {
+        const response = await fetch(url, options);
+        const text = await response.text();
+        result.textContent = `HTTP ${response.status} ${response.statusText}\n${text}`;
+      } catch (error) {
+        result.textContent = `Request failed: ${error.message}`;
+      }
+    }
+    document.querySelector('#commit').addEventListener('click', () => {
+      run('/commit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pageId: 'home', action: 'publish' })
+      });
+    });
+    document.querySelector('#load-page').addEventListener('click', () => run('/api/page'));
+    document.querySelector('#unmatched').addEventListener('click', () => run('/things'));
+    document.querySelector('#external').addEventListener('click', () => run('https://example.com/things'));
+  </script>
+</body>
+</html>

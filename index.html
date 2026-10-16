@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RaySite HTTP Simulator</title>
+  <link rel="stylesheet" href="/builder.css">
+</head>
+<body>
+  <main class="shell">
+    <h1>RaySite HTTP Simulator</h1>
+    <p class="intro">The preview makes same-origin requests. The service worker routes matching requests to simulated HTTP responses.</p>
+    <div id="status" class="status">Starting service worker…</div>
+
+    <section class="panel">
+      <h2>Builder state</h2>
+      <pre id="builder-state">{"page":"home","lastAction":null}</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Preview iframe</h2>
+      <iframe
+        id="preview"
+        title="Simulated website preview"
+        sandbox="allow-scripts allow-same-origin"
+        src="/preview.html"
+      ></iframe>
+    </section>
+
+    <section class="panel">
+      <h2>Request log</h2>
+      <ol id="log" aria-live="polite"></ol>
+    </section>
+  </main>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
